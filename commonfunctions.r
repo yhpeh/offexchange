@@ -102,15 +102,20 @@ Daily_Detailed_Report<-function(sd, manual=FALSE) {
   db <- dbConnect(SQLite(), dbname=paste0(dbfolder,"Rawdata.sqlite"))
   
   df_all<-dbGetQuery(db, paste('select * from Raw_PSMS where SettlementDate =', sd))
+  ##eclude DA code= '103'
+  excl_da<-"103"
+  df_all<-df_all[df_all$Sender != excl_da & df_all$Receiver != excl_da,]
   if (nrow(df_all)==0) stop('There is no relevant data in Table Raw_PSMS!')
   
+
   ##convert lowercase to uppercase
   df_all$BuySellIndicator<-toupper(df_all$BuySellIndicator)
   
   x_rate<-dbGetQuery(db, paste('select Currency, rate from Exchange_rate where SettlementDate =', sd))
   if (nrow(x_rate)==0) stop('There is no relevant data in Table Exchange_rate!')
   
-  last_price<-dbGetQuery(db, paste('select ISIN, Price from Closing_price where SettlementDate =', sd))
+  ##last_price<-dbGetQuery(db, paste('select ISIN, Price from Closing_price where SettlementDate =', sd))
+  last_price<-dbGetQuery(db, paste('select ISIN, Price, Currency as Trd_Currency from Closing_price where SettlementDate =', sd))
   if (nrow(last_price)==0) stop('There is no relevant data in Table Closing_price!')
   
   da<-dbGetQuery(db, 'select Sender, DaName from Depository_Agent')
@@ -290,6 +295,13 @@ Daily_Detailed_Report<-function(sd, manual=FALSE) {
   df_all$NotReported<-NA
   df_all$Currency <-as.character(df_all$SettlementCcy)
   df_all$Quantity<-as.numeric(df_all$Quantity)
+ 
+  ## Replace Currency with trading currency from Closing_Price table
+  idx<-with(df_all, TransactionType=='OFOP')
+  if (sum(idx)>0)  {
+    df_tmp<-join(df_all[idx,], last_price, by="ISIN",type="left")
+    df_all[idx,]$Currency <- as.character(df_tmp$Trd_Currency)
+  }
   
   #adding rate
   df_all<-join(df_all,x_rate,by='Currency',type = "left") 
@@ -297,6 +309,7 @@ Daily_Detailed_Report<-function(sd, manual=FALSE) {
   df_all$Rate<-as.numeric(df_all$Rate)
   
   #adding last_done_price
+  last_price<-subset(last_price, select = -Trd_Currency)
   df_all<-join(df_all,last_price,by='ISIN',type = "left") 
   df_all$Price<-as.numeric(df_all$Price)
   
