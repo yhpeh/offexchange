@@ -95,6 +95,61 @@ procEle <- function(df_list) {
   mapply(c,ret,ret2,SIMPLIFY=FALSE)
 }
 
+## Function to reclassify transfer type vector
+transfertype_reclass <- function(transfertype_vec) {
+  myTradeRelated<-transfertype_vec=='On-Exchange'
+  myOffExchange<-transfertype_vec =='Off-Exchange'
+  myMarketRelated<-transfertype_vec %in% c('SBLT', 'CONV', 'COLI', 'COLO', 'ETFT', 'SECB', 'SECL')
+  myOwnAccount<-transfertype_vec %in% c('OWNI', 'JONT')
+  myIssuerRelated<-transfertype_vec %in% c('ISSU', 'PLAC')
+  
+  transfertype_vec[myTradeRelated]<-'Trade-related'
+  transfertype_vec[myOffExchange]<-'Off-exchange'
+  transfertype_vec[myMarketRelated]<-'Market-related'
+  transfertype_vec[myOwnAccount]<-'Own account'
+  transfertype_vec[myIssuerRelated]<-'Issuer-related'
+  
+  transfertype_vec
+}
+
+overwrite <- function(df) {
+  
+  if (!is.null(df) && nrow(df) > 0) {
+    plOfTadeOrdered <- c("OTCO", "XSES", "XLON", "")
+    transferTypeOrdered <- c("OWNI", "JONT", "ISSU", "PLAC",
+      "ETFT", "CONV", "SECB", "SECL", "COLI", "COLO", "TRAD", "", "SBLT")
+    df$PlaceofTrade <- factor(df$PlaceofTrade, levels = plOfTadeOrdered)
+    df$TransferType <-
+      factor(df$TransferType, levels = transferTypeOrdered)
+    
+    o <- order(df$PSMSMatchedReference, df$PlaceofTrade, df$TransferType)
+    
+    prevRef <- -1
+    replacement <- NULL
+    
+    for (i in 1:nrow(df)) {
+      if (df[o[i], "PSMSMatchedReference"] == prevRef) {
+        if (df[o[i], "TransactionType"] == 'FDVP') {
+          df[o[i], "PlaceofTrade"] <- replacement$PlaceofTrade
+        }
+        else if (df[o[i], "TransactionType"] == "OFOP") {
+          # replace Place of Tade & Transfer Type
+          df[o[i], c("PlaceofTrade", "TransferType")] <- replacement
+        }
+      }
+      else {
+        prevRef <- df[o[i], "PSMSMatchedReference"]
+        replacement <- df[o[i], c("PlaceofTrade", "TransferType")]
+      }
+    }
+    
+    # Convert factor columns back to string
+    facCols <- c("PlaceofTrade", "TransferType")
+    df[, facCols] <- sapply(df[, facCols], as.character)
+  }
+
+  return(df)
+}
 
 ##Function for generation of Daily Detailed Report
 Daily_Detailed_Report<-function(sd, manual=FALSE) {
@@ -102,6 +157,9 @@ Daily_Detailed_Report<-function(sd, manual=FALSE) {
   db <- dbConnect(SQLite(), dbname=paste0(dbfolder,"Rawdata.sqlite"))
   
   df_all<-dbGetQuery(db, paste('select * from Raw_PSMS where SettlementDate =', sd))
+  ##exclude DA code= '103'
+  excl_da<-"103"
+  df_all<-df_all[df_all$Sender != excl_da & df_all$Receiver != excl_da, ]
   if (nrow(df_all)==0) stop('There is no relevant data in Table Raw_PSMS!')
   
   ##convert lowercase to uppercase
@@ -110,7 +168,8 @@ Daily_Detailed_Report<-function(sd, manual=FALSE) {
   x_rate<-dbGetQuery(db, paste('select Currency, rate from Exchange_rate where SettlementDate =', sd))
   if (nrow(x_rate)==0) stop('There is no relevant data in Table Exchange_rate!')
   
-  last_price<-dbGetQuery(db, paste('select ISIN, Price from Closing_price where SettlementDate =', sd))
+  ##last_price<-dbGetQuery(db, paste('select ISIN, Price from Closing_price where SettlementDate =', sd))
+  last_price<-dbGetQuery(db, paste('select ISIN, Price, Currency as Trd_Currency from Closing_price where SettlementDate =', sd))
   if (nrow(last_price)==0) stop('There is no relevant data in Table Closing_price!')
   
   da<-dbGetQuery(db, 'select Sender, DaName from Depository_Agent')
@@ -143,15 +202,31 @@ Daily_Detailed_Report<-function(sd, manual=FALSE) {
       SubsequentBuySell <- NA
     })
   }
-  ##select records with cdp account number and exclude 'SBLT' type
-  df_sub<-subset(df_all, TransferType!='SBLT' & CDPSafeKeepingAccount!='')
+  
+  ## perform overwrite for 2nd settlements (subsequent = 1)
+  selectCols<-c("PSMSMatchedReference", "PlaceofTrade",
+                "TransactionType", "TransferType")
+  df_all[df_all$subsequent==1, selectCols] <- overwrite(df_all[df_all$subsequent==1, selectCols])
   
   df_all$flag<-0
-  df_all[df_all$subsequent==0,]$flag<-1
+  if (nrow(df_all[df_all$subsequent==0,])>0) df_all[df_all$subsequent==0,]$flag<-1
+  
+  ## Flag OTOC/TRAD as off-exchange
+  conds<-df_all$PlaceofTrade=='OTCO' & df_all$TransferType=='TRAD'
+  if (nrow(df[conds,])>0) df_all[conds,]$flag<-'Off-Exchange'
   
   if (nrow(df_DCSS)>0) df_DCSS$flag<-1
-  df_all[df_all$TransferType=='SBLT',]$flag<-'SBLT'
-  df_sub$flag<-0
+  
+  ## Copy Transfer Type to flag for all non TRAD records
+  transferTypeToLink <- df_all$TransferType %in% c("TRAD", "")
+  df_all[ !transferTypeToLink ,]$flag<-as.character(df_all[ !transferTypeToLink ,]$TransferType)
+  
+  ## select records with cdp account number, transfer type = 'TRAD' 
+  ## or blank (for backward compatibility) and exclude already identified
+  ## off-exchange trades
+
+  df_sub<-subset(df_all, transferTypeToLink & CDPSafeKeepingAccount!=''
+                 & flag != 'Off-Exchange')
   
   ##Add one more column to keep matching details
   df_all$comments<-'null'
@@ -247,7 +322,8 @@ Daily_Detailed_Report<-function(sd, manual=FALSE) {
   
   iteration<-1
   
-  relevant_idxs <- with(df_all, subsequent==1 & TransferType!='SBLT')
+  ##relevant_idxs <- with(df_all, subsequent==1 & TransferType!='SBLT')
+  relevant_idxs <- with(df_all, subsequent==1 & flag %in% c(0, 1))
   split_grps <- df_all[relevant_idxs,]$Code_CDP
   
   repeat { 
@@ -290,6 +366,13 @@ Daily_Detailed_Report<-function(sd, manual=FALSE) {
   df_all$NotReported<-NA
   df_all$Currency <-as.character(df_all$SettlementCcy)
   df_all$Quantity<-as.numeric(df_all$Quantity)
+ 
+ # Replace Currency with trading currency from Closing_Price table
+ idx<-with(df_all, TransactionType=='OFOP')
+ if (sum(idx)>0)  {
+   df_tmp<-join(df_all[idx,], last_price, by="ISIN",type="left")
+   df_all[idx,]$Currency <- as.character(df_tmp$Trd_Currency)
+ }
   
   #adding rate
   df_all<-join(df_all,x_rate,by='Currency',type = "left") 
@@ -297,6 +380,7 @@ Daily_Detailed_Report<-function(sd, manual=FALSE) {
   df_all$Rate<-as.numeric(df_all$Rate)
   
   #adding last_done_price
+  last_price<-subset(last_price, select = -Trd_Currency)
   df_all<-join(df_all,last_price,by='ISIN',type = "left") 
   df_all$Price<-as.numeric(df_all$Price)
   
@@ -458,7 +542,7 @@ Daily_Summary_Report<-function(sd, manual=FALSE) {
   fontbold<-Font(wb,isBold=TRUE)
   csrow<-CellStyle(wb,border=Border(color="black", position=c("TOP","BOTTOM"))
                    ,font=fontbold)
-  
+
   csdollar<-CellStyle(wb, dataFormat=DataFormat('_($* #,##0_);_($* (#,##0);_($* "-"??_);_(@_)')
                       ,border=Border(color="black", position=c("TOP","BOTTOM"))
                       ,font=fontbold)
@@ -509,8 +593,8 @@ Daily_Summary_Report<-function(sd, manual=FALSE) {
   row.names(F_settlement)<-'First Settlement'
   
   addDataFrame(F_settlement, sheet1, col.names=FALSE, row.names=TRUE,
-               startRow=4, startColumn=2, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency),
-  )
+               startRow=4, startColumn=2, colStyle=list('1'=cscomma,
+               '2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency))
   
   S_settlement<-dbGetQuery(db, paste('select count(*) Number_of_Instructions, 
                                      sum(SettlementValue_SGD)  Settlement_Value,
@@ -522,8 +606,8 @@ Daily_Summary_Report<-function(sd, manual=FALSE) {
   row.names(S_settlement)<-'Subsequent Settlement'
   
   addDataFrame(S_settlement, sheet1, col.names=FALSE, row.names=TRUE,
-               startRow=5, startColumn=2, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency),
-  )
+               startRow=5, startColumn=2, colStyle=list('1'=cscomma,
+               '2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency))
   
   on_off_SBLT<-dbGetQuery(db, sprintf('select flag as type,
                                       count(*) Number_of_Instructions, 
@@ -536,17 +620,17 @@ Daily_Summary_Report<-function(sd, manual=FALSE) {
                                       and subsequent=1
                                       group by flag', sd))
   
-  names <- on_off_SBLT$type
-  names[names=='Off-Exchange']<-'    Off-exchange'
-  names[names=='On-Exchange']<-'    Trade-related'
-  names[names=='SBLT']<-'    Market-related'
+  on_off_SBLT$type<-transfertype_reclass(on_off_SBLT$type)
   
-  on_off_SBLT<-on_off_SBLT[,-1]
-  row.names(on_off_SBLT)<-names
+  ## Aggregate data frame again based on new groupings
+  on_off_SBLT <- aggregate(. ~ type, on_off_SBLT, sum)
   
+  rownames(on_off_SBLT)<-paste0("   ", on_off_SBLT$type)
+  on_off_SBLT$type<-NULL
   
-  addDataFrame(on_off_SBLT, sheet1, col.names=FALSE, row.names=TRUE,
-               startRow=6, startColumn=2, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency))
+  addDataFrame(on_off_SBLT, sheet1, col.names=FALSE, row.names=TRUE, 
+               startRow=6, startColumn=2, colStyle=list('1'=cscomma,
+              '2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency))
   ##rownamesStyle=csindent)
   
   DCSS<-dbGetQuery(db, paste('select count(*) Number_of_Instructions, 
@@ -558,8 +642,8 @@ Daily_Summary_Report<-function(sd, manual=FALSE) {
                              where subsequent="DCSS" and SettlementDate =', sd))
   row.names(DCSS)<-'OTC Bonds Settlement'
   addDataFrame(DCSS, sheet1, col.names=FALSE, row.names=TRUE,
-               startRow=10, startColumn=2, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency),
-  )
+               startRow=11, startColumn=2, colStyle=list('1'=cscomma,
+               '2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency))
   
   T_S_settlement<-cbind('Total Subsequent Settlement', '', S_settlement)
   
@@ -567,7 +651,7 @@ Daily_Summary_Report<-function(sd, manual=FALSE) {
                            'Settlement Value', 'Volume', 'Revenue (New Fee)', 'Off-Exchange Fee Gain (Net Fee)')
   
   addDataFrame((T_S_settlement), sheet1, col.names=TRUE, row.names=FALSE,
-               startRow=12, startColumn=1, 
+               startRow=13, startColumn=1, 
                colStyle=list('1'=csrow,'2'=csrow,'3'=csborder,'4'=csdollar,'5'=csborder,'6'=csdollar, '7'=csdollar),
                colnamesStyle=cscenter
   )
@@ -583,11 +667,13 @@ Daily_Summary_Report<-function(sd, manual=FALSE) {
                                          SettlementDate = %s
                                          group by TransactionType, flag', sd))
   
-  idx<-with(Sub_settlement, Settlement_Type=='SBLT')
-  if(sum(idx)>0) Sub_settlement[idx,]$Settlement_Type<-'Market related'
+  Sub_settlement$Settlement_Type<-transfertype_reclass(Sub_settlement$Settlement_Type)
+  
+  ## Aggregate data frame again based on new groupings
+  Sub_settlement <- aggregate(. ~ TransactionType + Settlement_Type, Sub_settlement, sum)
   
   addDataFrame(Sub_settlement, sheet1, col.names=FALSE, row.names=FALSE,
-               startRow=14, startColumn=1, 
+               startRow=15, startColumn=1, 
                colStyle=list('3'=cscomma,'4'=cscurrency,'5'=cscomma,'6'=cscurrency, '7'=cscurrency)
                
   )
@@ -809,8 +895,7 @@ Weekly_Summary_Report<-function(start, end, manual=FALSE) {
   row.names(F_settlement)<-'First Settlement'
   
   addDataFrame(F_settlement, sheet1, col.names=FALSE, row.names=TRUE,
-               startRow=4, startColumn=2, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency),
-  )
+               startRow=4, startColumn=2, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency))
   
   S_settlement<-dbGetQuery(db, paste0('select count(*) Number_of_Instructions, 
                                       sum(SettlementValue_SGD)  Settlement_Value,
@@ -822,8 +907,7 @@ Weekly_Summary_Report<-function(start, end, manual=FALSE) {
   row.names(S_settlement)<-'Subsequent Settlement'
   
   addDataFrame(S_settlement, sheet1, col.names=FALSE, row.names=TRUE,
-               startRow=5, startColumn=2, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency),
-  )
+               startRow=5, startColumn=2, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency))
   
   on_off_SBLT<-dbGetQuery(db, sprintf('select flag as type,
                                       count(*) Number_of_Instructions, 
@@ -836,14 +920,13 @@ Weekly_Summary_Report<-function(start, end, manual=FALSE) {
                                       and subsequent=1
                                       group by flag', start, end))
   
-  names <- on_off_SBLT$type
-  names[names=='Off-Exchange']<-'    Off-exchange'
-  names[names=='On-Exchange']<-'    Trade-related'
-  names[names=='SBLT']<-'    Market-related'
+  on_off_SBLT$type<-transfertype_reclass(on_off_SBLT$type)
   
-  on_off_SBLT<-on_off_SBLT[,-1]
-  row.names(on_off_SBLT)<-names
+  ## Aggregate data frame again based on new groupings
+  on_off_SBLT <- aggregate(. ~ type, on_off_SBLT, sum)
   
+  rownames(on_off_SBLT)<-paste0("  ", on_off_SBLT$type)
+  on_off_SBLT$type<-NULL
   
   addDataFrame(on_off_SBLT, sheet1, col.names=FALSE, row.names=TRUE,
                startRow=6, startColumn=2, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency))
@@ -858,7 +941,7 @@ Weekly_Summary_Report<-function(start, end, manual=FALSE) {
                               where subsequent="DCSS" and SettlementDate >=', start,' and SettlementDate <=',end))
   row.names(DCSS)<-'OTC Bonds Settlement'
   addDataFrame(DCSS, sheet1, col.names=FALSE, row.names=TRUE,
-               startRow=10, startColumn=2, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency),
+               startRow=10, startColumn=2, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency)
   )
   
   T_S_settlement<-cbind('Total Subsequent Settlement', '', S_settlement)
@@ -883,8 +966,11 @@ Weekly_Summary_Report<-function(start, end, manual=FALSE) {
                                          SettlementDate >= %s and SettlementDate <= %s
                                          group by TransactionType, flag', start, end))
   
-  Sub_settlement[Sub_settlement$Settlement_Type=='SBLT',]$Settlement_Type<-'Market related'
+  Sub_settlement$Settlement_Type<-transfertype_reclass(Sub_settlement$Settlement_Type)
   
+  ## Aggregate data frame again based on new groupings
+  Sub_settlement <- aggregate(. ~ TransactionType + Settlement_Type, Sub_settlement, sum) 
+ 
   addDataFrame(Sub_settlement, sheet1, col.names=FALSE, row.names=FALSE,
                startRow=14, startColumn=1, 
                colStyle=list('3'=cscomma,'4'=cscurrency,'5'=cscomma,'6'=cscurrency, '7'=cscurrency)
@@ -913,7 +999,7 @@ Weekly_Summary_Report<-function(start, end, manual=FALSE) {
                rownamesStyle=csrow)
   
   addDataFrame(all_by_trans, sheet2, col.names=FALSE, row.names=TRUE,
-               startRow=3, startColumn=1, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency),
+               startRow=3, startColumn=1, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency)
   )
   
   ##sheet 3
@@ -1115,8 +1201,8 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
   row.names(F_settlement)<-'First Settlement'
   
   addDataFrame(F_settlement, sheet1, col.names=FALSE, row.names=TRUE,
-               startRow=4, startColumn=2, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency),
-  )
+               startRow=4, startColumn=2, colStyle=list('1'=cscomma,
+               '2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency))
   
   S_settlement<-dbGetQuery(db, paste0('select count(*) Number_of_Instructions, 
                                       sum(SettlementValue_SGD)  Settlement_Value,
@@ -1128,8 +1214,8 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
   row.names(S_settlement)<-'Subsequent Settlement'
   
   addDataFrame(S_settlement, sheet1, col.names=FALSE, row.names=TRUE,
-               startRow=5, startColumn=2, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency),
-  )
+               startRow=5, startColumn=2, colStyle=list('1'=cscomma,
+               '2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency))
   
   on_off_SBLT<-dbGetQuery(db, sprintf('select flag as type,
                                       count(*) Number_of_Instructions, 
@@ -1142,14 +1228,13 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                                       and subsequent=1
                                       group by flag', start, end))
   
-  names <- on_off_SBLT$type
-  names[names=='Off-Exchange']<-'    Off-exchange'
-  names[names=='On-Exchange']<-'    Trade-related'
-  names[names=='SBLT']<-'    Market-related'
+  on_off_SBLT$type<-transfertype_reclass(on_off_SBLT$type)
   
-  on_off_SBLT<-on_off_SBLT[,-1]
-  row.names(on_off_SBLT)<-names
-  
+  ## Aggregate data frame again based on new groupings
+  on_off_SBLT <- aggregate(. ~ type, on_off_SBLT, sum)
+
+  rownames(on_off_SBLT)<-paste0("  ", on_off_SBLT$type)
+  on_off_SBLT$type<-NULL
   
   addDataFrame(on_off_SBLT, sheet1, col.names=FALSE, row.names=TRUE,
                startRow=6, startColumn=2, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency))
@@ -1164,8 +1249,8 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                               where subsequent="DCSS" and SettlementDate >=', start,' and SettlementDate <=',end))
   row.names(DCSS)<-'OTC Bonds Settlement'
   addDataFrame(DCSS, sheet1, col.names=FALSE, row.names=TRUE,
-               startRow=10, startColumn=2, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency),
-  )
+               startRow=10, startColumn=2, colStyle=list('1'=cscomma,
+               '2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency))
   
   T_S_settlement<-cbind('Total Subsequent Settlement', '', S_settlement)
   
@@ -1189,7 +1274,10 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                                          SettlementDate >= %s and SettlementDate <= %s
                                          group by TransactionType, flag', start, end))
   
-  Sub_settlement[Sub_settlement$Settlement_Type=='SBLT',]$Settlement_Type<-'Market related'
+  Sub_settlement$Settlement_Type<-transfertype_reclass(Sub_settlement$Settlement_Type)
+  
+  ## Aggregate data frame again based on new groupings
+  Sub_settlement <- aggregate(. ~ TransactionType + Settlement_Type, Sub_settlement, sum) 
   
   addDataFrame(Sub_settlement, sheet1, col.names=FALSE, row.names=FALSE,
                startRow=14, startColumn=1, 
@@ -1219,8 +1307,8 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                rownamesStyle=csrow)
   
   addDataFrame(all_by_trans, sheet2, col.names=FALSE, row.names=TRUE,
-               startRow=3, startColumn=1, colStyle=list('1'=cscomma,'2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency),
-  )
+               startRow=3, startColumn=1, colStyle=list('1'=cscomma,
+               '2'=cscurrency,'3'=cscomma,'4'=cscurrency,'5'=cscurrency))
   
   ##sheet 3
   #write.xlsx(all_by_trans, sprintf("%s.xlsx",file_name), sheetName="Breakdown by Transaction type", append=TRUE)
@@ -1246,18 +1334,23 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
   )
   
   
-  S_secu<-dbGetQuery(db, sprintf('select  SecurityDescription, 
-                                 count(*) Number_of_Instruction,
-                                 sum(SettlementValue_SGD) as Settlement_Value,
-                                 sum(Quantity) Volume,
-                                 sum(NewFee) Fee,
-                                 sum(FeeGain) Net_Fee
-                                 from output_daily
-                                 where subsequent=1 and
-                                 SettlementDate >= %s and SettlementDate <= %s
-                                 group by SecurityDescription
-                                 order by Settlement_Value DESC
-                                 limit 20', start, end))
+  S_secu_breakdown<-dbGetQuery(db, sprintf('select flag as type,
+                                        SecurityDescription, 
+                                        count(*) Number_of_Instruction,
+                                        sum(SettlementValue_SGD) as Settlement_Value,
+                                        sum(Quantity) Volume,
+                                        sum(NewFee) Fee,
+                                        sum(FeeGain) Net_Fee
+                                        from output_daily
+                                        where subsequent=1 and
+                                        SettlementDate >= %s and SettlementDate <= %s
+                                        group by flag, SecurityDescription',
+                                        start, end))
+  if (nrow(S_secu_breakdown) > 0) {
+    S_secu<- aggregate(S_secu_breakdown[3:7], by=list(S_secu_breakdown$SecurityDescription), sum)
+  }
+  S_secu<-head(arrange(S_secu, desc(Settlement_Value)),n=20)
+  S_secu$type<-NULL
   
   names(S_secu)<-c('Subseqent Settlement', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
   
@@ -1265,38 +1358,24 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                startRow=23, startColumn=1, colStyle=list('2'=cscomma,'3'=cscurrency,'4'=cscomma,'5'=cscurrency,'6'=cscurrency),
                colnamesStyle=cscenter)  
   
+  S_secu_breakdown$type<-transfertype_reclass(S_secu_breakdown$type)
+  if (nrow(S_secu_breakdown) > 0) {
+    S_secu_breakdown<-aggregate(. ~ type + SecurityDescription, S_secu_breakdown, sum)
+  }
   
-  trade_related<-dbGetQuery(db, sprintf('select SecurityDescription, 
-                                        count(*) Number_of_Instruction,
-                                        sum(SettlementValue_SGD) as Settlement_Value,
-                                        sum(Quantity) Volume,
-                                        sum(NewFee) Fee,
-                                        sum(FeeGain) Net_Fee
-                                        from output_daily
-                                        where subsequent=1 and flag="On-Exchange" and
-                                        SettlementDate >= %s and SettlementDate <= %s
-                                        group by SecurityDescription
-                                        order by Settlement_Value DESC
-                                        limit 20', start, end))
-  
+  trade_related<-head(arrange(S_secu_breakdown[S_secu_breakdown$type=="Trade-related", ], 
+                         desc(Settlement_Value)),n=20)
+  trade_related$type<-NULL
+
   names(trade_related)<-c('Trade Related', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
   
   addDataFrame(trade_related, sheet3, col.names=TRUE, row.names=FALSE,
                startRow=45, startColumn=1, colStyle=list('2'=cscomma,'3'=cscurrency,'4'=cscomma,'5'=cscurrency,'6'=cscurrency),
                colnamesStyle=cscenter) 
   
-  market_related<-dbGetQuery(db, sprintf('select  SecurityDescription, 
-                                         count(*) Number_of_Instruction,
-                                         sum(SettlementValue_SGD) as Settlement_Value,
-                                         sum(Quantity) Volume,
-                                         sum(NewFee) Fee,
-                                         sum(FeeGain) Net_Fee
-                                         from output_daily
-                                         where subsequent=1 and flag="SBLT" and
-                                         SettlementDate >= %s and SettlementDate <= %s
-                                         group by SecurityDescription
-                                         order by Settlement_Value DESC
-                                         limit 20', start, end))
+  market_related<-head(arrange(S_secu_breakdown[S_secu_breakdown$type=="Market-related",],
+                              desc(Settlement_Value)), n=20)
+  market_related$type<-NULL
   
   names(market_related)<-c('Market Related', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
   
@@ -1304,25 +1383,35 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                startRow=67, startColumn=1, colStyle=list('2'=cscomma,'3'=cscurrency,'4'=cscomma,'5'=cscurrency,'6'=cscurrency),
                colnamesStyle=cscenter)            
   
-  
-  off_exchange<-dbGetQuery(db, sprintf('select  SecurityDescription, 
-                                       count(*) Number_of_Instruction,
-                                       sum(SettlementValue_SGD) as Settlement_Value,
-                                       sum(Quantity) Volume,
-                                       sum(NewFee) Fee,
-                                       sum(FeeGain) Net_Fee
-                                       from output_daily
-                                       where subsequent=1 and flag="Off-Exchange" and
-                                       SettlementDate >= %s and SettlementDate <= %s
-                                       group by SecurityDescription
-                                       order by Settlement_Value DESC
-                                       limit 20', start, end))
+  off_exchange<-head(arrange(S_secu_breakdown[S_secu_breakdown$type=="Off-exchange",],
+                               desc(Settlement_Value)), n=20)
+  off_exchange$type<-NULL
   
   names(off_exchange)<-c('Off-exchange', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
   
   addDataFrame(off_exchange, sheet3, col.names=TRUE, row.names=FALSE,
                startRow=89, startColumn=1, colStyle=list('2'=cscomma,'3'=cscurrency,'4'=cscomma,'5'=cscurrency,'6'=cscurrency),
-               colnamesStyle=cscenter)             
+               colnamesStyle=cscenter)
+
+  own_account<-head(arrange(S_secu_breakdown[S_secu_breakdown$type=="Own Account",],
+                             desc(Settlement_Value)), n=20)
+  own_account$type<-NULL
+  
+  names(own_account)<-c('Own Account', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
+  
+  addDataFrame(own_account, sheet3, col.names=TRUE, row.names=FALSE,
+               startRow=111, startColumn=1, colStyle=list('2'=cscomma,'3'=cscurrency,'4'=cscomma,'5'=cscurrency,'6'=cscurrency),
+               colnamesStyle=cscenter)
+  
+  issuer_related<-head(arrange(S_secu_breakdown[S_secu_breakdown$type=="Issuer-related",],
+                             desc(Settlement_Value)), n=20)
+  issuer_related$type<-NULL
+  
+  names(issuer_related)<-c('Issuer Related', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
+  
+  addDataFrame(issuer_related, sheet3, col.names=TRUE, row.names=FALSE,
+               startRow=133, startColumn=1, colStyle=list('2'=cscomma,'3'=cscurrency,'4'=cscomma,'5'=cscurrency,'6'=cscurrency),
+               colnamesStyle=cscenter)  
   
   ##sheet 4
   #write.xlsx(all_by_trans, sprintf("%s.xlsx",file_name), sheetName="Breakdown by Transaction type", append=TRUE)
@@ -1347,7 +1436,7 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                colnamesStyle=cscenter
   )
   
-  S_da<-dbGetQuery(db, sprintf('select  DaName, 
+  S_da_breakdown<-dbGetQuery(db, sprintf('select flag as type, DaName, 
                                count(*) Number_of_Instruction,
                                sum(SettlementValue_SGD) as Settlement_Value,
                                sum(Quantity) Volume,
@@ -1356,9 +1445,13 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                                from output_daily
                                where subsequent=1 and
                                SettlementDate >= %s and SettlementDate <= %s
-                               group by DaName
-                               order by Settlement_Value DESC
-                               limit 20', start, end))       
+                               group by flag, DaName', 
+                               start, end))
+  if (nrow(S_da_breakdown) > 0) {
+    S_da<- aggregate(S_da_breakdown[3:7], by=list(S_da_breakdown$DaName), sum)
+  }
+  S_da<-head(arrange(S_da, desc(Settlement_Value)),n=20)
+  S_da$type<-NULL
   
   names(S_da)<-c('Subsequent Settlement', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
   
@@ -1367,18 +1460,14 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                colnamesStyle=cscenter
   )             
   
-  trade_da<-dbGetQuery(db, sprintf('select DaName,
-                                   count(*) Number_of_Instruction,
-                                   sum(SettlementValue_SGD) as Settlement_Value,
-                                   sum(Quantity) Volume,
-                                   sum(NewFee) Fee,
-                                   sum(FeeGain) Net_Fee
-                                   from output_daily
-                                   where subsequent=1 and flag="On-Exchange" and
-                                   SettlementDate >= %s and SettlementDate <= %s
-                                   group by DaName
-                                   order by Settlement_Value DESC
-                                   limit 20', start, end))
+  S_da_breakdown$type<-transfertype_reclass(S_da_breakdown$type)
+  if (nrow(S_da_breakdown) > 0) {
+    S_da_breakdown<-aggregate(. ~ type + DaName, S_da_breakdown, sum)
+  }
+
+  trade_da<-head(arrange(S_da_breakdown[S_da_breakdown$type=="Trade-related", ], 
+                         desc(Settlement_Value)),n=20)
+  trade_da$type<-NULL
   
   names(trade_da)<-c('Trade Related', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
   addDataFrame(trade_da, sheet4, col.names=TRUE, row.names=FALSE,
@@ -1386,18 +1475,9 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                colnamesStyle=cscenter
   )   
   
-  market_da<-dbGetQuery(db, sprintf('select DaName,
-                                    count(*) Number_of_Instruction,
-                                    sum(SettlementValue_SGD) as Settlement_Value,
-                                    sum(Quantity) Volume,
-                                    sum(NewFee) Fee,
-                                    sum(FeeGain) Net_Fee
-                                    from output_daily
-                                    where subsequent=1 and flag="SBLT" and
-                                    SettlementDate >= %s and SettlementDate <= %s
-                                    group by DaName
-                                    order by Settlement_Value DESC
-                                    limit 20', start, end))
+  market_da<-head(arrange(S_da_breakdown[S_da_breakdown$type=="Market-related", ], 
+                         desc(Settlement_Value)),n=20)
+  market_da$type<-NULL
   
   names(market_da)<-c('Market Related', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
   addDataFrame(market_da, sheet4, col.names=TRUE, row.names=FALSE,
@@ -1405,25 +1485,33 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                colnamesStyle=cscenter
   ) 
   
-  off_da<-dbGetQuery(db, sprintf('select DaName,
-                                 count(*) Number_of_Instruction,
-                                 sum(SettlementValue_SGD) as Settlement_Value,
-                                 sum(Quantity) Volume,
-                                 sum(NewFee) Fee,
-                                 sum(FeeGain) Net_Fee
-                                 from output_daily
-                                 where subsequent=1 and flag="Off-Exchange" and
-                                 SettlementDate >= %s and SettlementDate <= %s
-                                 group by DaName
-                                 order by Settlement_Value DESC
-                                 limit 20', start, end))
+  off_da<-head(arrange(S_da_breakdown[S_da_breakdown$type=="Off-exchange", ], 
+                          desc(Settlement_Value)),n=20)
+  off_da$type<-NULL
   
   names(off_da)<-c('Off-exchange', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
   addDataFrame(off_da, sheet4, col.names=TRUE, row.names=FALSE,
                startRow=89, startColumn=1, colStyle=list('2'=cscomma,'3'=cscurrency,'4'=cscomma,'5'=cscurrency,'6'=cscurrency),
                colnamesStyle=cscenter
-  ) 
+  )
   
+  own_da<-head(arrange(S_da_breakdown[S_da_breakdown$type=="Own account", ], 
+                       desc(Settlement_Value)),n=20)
+  own_da$type<-NULL
+  
+  names(own_da)<-c('Own Account', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
+  addDataFrame(own_da, sheet4, col.names=TRUE, row.names=FALSE,
+               startRow=111, startColumn=1, colStyle=list('2'=cscomma,'3'=cscurrency,'4'=cscomma,'5'=cscurrency,'6'=cscurrency),
+               colnamesStyle=cscenter)
+               
+  issuer_da<-head(arrange(S_da_breakdown[S_da_breakdown$type=="Issuer-related", ], 
+                       desc(Settlement_Value)),n=20)
+  issuer_da$type<-NULL
+  
+  names(issuer_da)<-c('Issuer Related', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
+  addDataFrame(issuer_da, sheet4, col.names=TRUE, row.names=FALSE,
+               startRow=133, startColumn=1, colStyle=list('2'=cscomma,'3'=cscurrency,'4'=cscomma,'5'=cscurrency,'6'=cscurrency),
+               colnamesStyle=cscenter)  
   
   ##sheet 5
   #write.xlsx(all_by_trans, sprintf("%s.xlsx",file_name), sheetName="Breakdown by Transaction type", append=TRUE)
@@ -1450,7 +1538,8 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
   )
   
   
-  S_cdp<-dbGetQuery(db, sprintf('select  CDPAccountName, DaName,
+  S_cdp_breakdown<-dbGetQuery(db, sprintf('select flag as type, 
+                                CDPAccountName, DaName,
                                 count(*) Number_of_Instruction,
                                 sum(SettlementValue_SGD) as Settlement_Value,
                                 sum(Quantity) Volume,
@@ -1459,9 +1548,15 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                                 from output_daily
                                 where subsequent=1 and
                                 SettlementDate >= %s and SettlementDate <= %s
-                                group by CDPAccountName
-                                order by Settlement_Value DESC
-                                limit 20', start, end))       
+                                group by flag, CDPAccountName, DaName',
+                                start, end)) 
+  
+  if (nrow(S_cdp_breakdown) > 0) {
+    S_cdp<- aggregate(S_cdp_breakdown[4:8], 
+                     by=list(S_cdp_breakdown$CDPAccountName, S_cdp_breakdown$DaName), sum)
+  }
+  S_cdp<-head(arrange(S_cdp, desc(Settlement_Value)),n=20)
+  S_cdp$type<-NULL
   
   names(S_cdp)<-c('Subsequent Settlement', 'DA', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
   
@@ -1470,18 +1565,15 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                colnamesStyle=cscenter
   )            
   
-  trade_cdp<-dbGetQuery(db, sprintf('select CDPAccountName, DaName,
-                                    count(*) Number_of_Instruction,
-                                    sum(SettlementValue_SGD) as Settlement_Value,
-                                    sum(Quantity) Volume,
-                                    sum(NewFee) Fee,
-                                    sum(FeeGain) Net_Fee
-                                    from output_daily
-                                    where subsequent=1 and flag="On-Exchange" and
-                                    SettlementDate >= %s and SettlementDate <= %s
-                                    group by CDPAccountName
-                                    order by Settlement_Value DESC
-                                    limit 20', start, end))
+  S_cdp_breakdown$type<-transfertype_reclass(S_cdp_breakdown$type)
+  if (nrow(S_cdp_breakdown) > 0) {
+    S_cdp_breakdown<-aggregate(. ~ type + CDPAccountName + DaName, 
+                               S_cdp_breakdown, sum)
+  }
+  
+  trade_cdp<-head(arrange(S_cdp_breakdown[S_cdp_breakdown$type=="Trade-related", ], 
+                         desc(Settlement_Value)),n=20)
+  trade_cdp$type<-NULL
   
   names(trade_cdp)<-c('Trade Related', 'DA', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
   addDataFrame(trade_cdp, sheet5, col.names=TRUE, row.names=FALSE,
@@ -1490,38 +1582,19 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
   )   
   
   
-  market_cdp<-dbGetQuery(db, sprintf('select CDPAccountName, DaName,
-                                     count(*) Number_of_Instruction,
-                                     sum(SettlementValue_SGD) as Settlement_Value,
-                                     sum(Quantity) Volume,
-                                     sum(NewFee) Fee,
-                                     sum(FeeGain) Net_Fee
-                                     from output_daily
-                                     where subsequent=1 and flag="SBLT" and
-                                     SettlementDate >= %s and SettlementDate <= %s
-                                     group by CDPAccountName
-                                     order by Settlement_Value DESC
-                                     limit 20', start, end))
+  market_cdp<-head(arrange(S_cdp_breakdown[S_cdp_breakdown$type=="Market-related", ], 
+                          desc(Settlement_Value)),n=20)
+  market_cdp$type<-NULL
   
   names(market_cdp)<-c('Market Related', 'DA', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
   addDataFrame(market_cdp, sheet5, col.names=TRUE, row.names=FALSE,
                startRow=67, startColumn=1, colStyle=list('3'=cscomma,'4'=cscurrency,'5'=cscomma,'6'=cscurrency,'7'=cscurrency),
                colnamesStyle=cscenter
-  ) 
+  )
   
-  
-  off_cdp<-dbGetQuery(db, sprintf('select CDPAccountName, DaName,
-                                  count(*) Number_of_Instruction,
-                                  sum(SettlementValue_SGD) as Settlement_Value,
-                                  sum(Quantity) Volume,
-                                  sum(NewFee) Fee,
-                                  sum(FeeGain) Net_Fee
-                                  from output_daily
-                                  where subsequent=1 and flag="Off-Exchange" and
-                                  SettlementDate >= %s and SettlementDate <= %s
-                                  group by CDPAccountName
-                                  order by Settlement_Value DESC
-                                  limit 20', start, end))
+  off_cdp<-head(arrange(S_cdp_breakdown[S_cdp_breakdown$type=="Off-exchange", ], 
+                           desc(Settlement_Value)),n=20)
+  off_cdp$type<-NULL
   
   names(off_cdp)<-c('Off-exchange', 'DA', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
   addDataFrame(off_cdp, sheet5, col.names=TRUE, row.names=FALSE,
@@ -1529,6 +1602,26 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                colnamesStyle=cscenter
   ) 
   
+  own_cdp<-head(arrange(S_cdp_breakdown[S_cdp_breakdown$type=="Own account", ], 
+                        desc(Settlement_Value)),n=20)
+  own_cdp$type<-NULL
+  
+  names(own_cdp)<-c('Own Account', 'DA', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
+  addDataFrame(own_cdp, sheet5, col.names=TRUE, row.names=FALSE,
+               startRow=111, startColumn=1, colStyle=list('3'=cscomma,'4'=cscurrency,'5'=cscomma,'6'=cscurrency,'7'=cscurrency),
+               colnamesStyle=cscenter
+  ) 
+  
+  issuer_cdp<-head(arrange(S_cdp_breakdown[S_cdp_breakdown$type=="Issuer-related", ], 
+                        desc(Settlement_Value)),n=20)
+  issuer_cdp$type<-NULL
+  
+  names(issuer_cdp)<-c('Issuer Related', 'DA', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
+  addDataFrame(issuer_cdp, sheet5, col.names=TRUE, row.names=FALSE,
+               startRow=133, startColumn=1, colStyle=list('3'=cscomma,'4'=cscurrency,'5'=cscomma,'6'=cscurrency,'7'=cscurrency),
+               colnamesStyle=cscenter
+  ) 
+
   ##sheet 6
   #write.xlsx(all_by_trans, sprintf("%s.xlsx",file_name), sheetName="Breakdown by Transaction type", append=TRUE)
   
@@ -1554,7 +1647,7 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
   )
   
   
-  S_location<-dbGetQuery(db, sprintf('select Location, 
+  S_location_breakdown<-dbGetQuery(db, sprintf('select flag as type, Location, 
                                      count(*) Number_of_Instruction,
                                      sum(SettlementValue_SGD) as Settlement_Value,
                                      sum(Quantity) Volume,
@@ -1563,9 +1656,14 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                                      from output_daily
                                      where subsequent=1 and
                                      SettlementDate >= %s and SettlementDate <= %s
-                                     group by Location
-                                     order by Settlement_Value DESC
-                                     limit 20', start, end))       
+                                     group by flag, Location',
+                                     start, end))       
+  if (nrow(S_location_breakdown) > 0) {
+    S_location<- aggregate(S_location_breakdown[3:7], 
+                      by=list(S_location_breakdown$Location), sum)
+  }
+  S_location<-head(arrange(S_location, desc(Settlement_Value)),n=20)
+  S_location$type<-NULL
   
   names(S_location)<-c('Subsequent Settlement', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
   
@@ -1573,39 +1671,26 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                startRow=23, startColumn=1, colStyle=list('2'=cscomma,'3'=cscurrency,'4'=cscomma,'5'=cscurrency,'6'=cscurrency),
                colnamesStyle=cscenter
   )            
+
+  S_location_breakdown$type<-transfertype_reclass(S_location_breakdown$type)
+  if (nrow(S_location_breakdown) > 0) {
+    S_location_breakdown<-aggregate(. ~ type + Location, 
+                                    S_location_breakdown, sum)
+  }
   
-  trade_location<-dbGetQuery(db, sprintf('select Location,
-                                         count(*) Number_of_Instruction,
-                                         sum(SettlementValue_SGD) as Settlement_Value,
-                                         sum(Quantity) Volume,
-                                         sum(NewFee) Fee,
-                                         sum(FeeGain) Net_Fee
-                                         from output_daily
-                                         where subsequent=1 and flag="On-Exchange" and
-                                         SettlementDate >= %s and SettlementDate <= %s
-                                         group by Location
-                                         order by Settlement_Value DESC
-                                         limit 20', start, end))
-  
+  trade_location<-head(arrange(S_location_breakdown[S_location_breakdown$type=="Trade-related", ], 
+                          desc(Settlement_Value)),n=20)
+  trade_location$type<-NULL
+
   names(trade_location)<-c('Trade Related', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
   addDataFrame(trade_location, sheet6, col.names=TRUE, row.names=FALSE,
                startRow=45, startColumn=1, colStyle=list('2'=cscomma,'3'=cscurrency,'4'=cscomma,'5'=cscurrency,'6'=cscurrency),
                colnamesStyle=cscenter
   )   
   
-  
-  market_location<-dbGetQuery(db, sprintf('select Location,
-                                          count(*) Number_of_Instruction,
-                                          sum(SettlementValue_SGD) as Settlement_Value,
-                                          sum(Quantity) Volume,
-                                          sum(NewFee) Fee,
-                                          sum(FeeGain) Net_Fee
-                                          from output_daily
-                                          where subsequent=1 and flag="SBLT" and
-                                          SettlementDate >= %s and SettlementDate <= %s
-                                          group by Location
-                                          order by Settlement_Value DESC
-                                          limit 20', start, end))
+  market_location<-head(arrange(S_location_breakdown[S_location_breakdown$type=="Market-related", ], 
+                               desc(Settlement_Value)),n=20)
+  market_location$type<-NULL
   
   names(market_location)<-c('Market Related', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
   addDataFrame(market_location, sheet6, col.names=TRUE, row.names=FALSE,
@@ -1613,19 +1698,9 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                colnamesStyle=cscenter
   ) 
   
-  
-  off_location<-dbGetQuery(db, sprintf('select Location,
-                                       count(*) Number_of_Instruction,
-                                       sum(SettlementValue_SGD) as Settlement_Value,
-                                       sum(Quantity) Volume,
-                                       sum(NewFee) Fee,
-                                       sum(FeeGain) Net_Fee
-                                       from output_daily
-                                       where subsequent=1 and flag="Off-Exchange" and
-                                       SettlementDate >= %s and SettlementDate <= %s
-                                       group by Location
-                                       order by Settlement_Value DESC
-                                       limit 20', start, end))
+  off_location<-head(arrange(S_location_breakdown[S_location_breakdown$type=="Off-exchange", ], 
+                                desc(Settlement_Value)),n=20)
+  off_location$type<-NULL
   
   names(off_location)<-c('Off-exchange', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
   addDataFrame(off_location, sheet6, col.names=TRUE, row.names=FALSE,
@@ -1633,7 +1708,25 @@ Monthly_Summary_Report<-function(start, end, manual=FALSE) {
                colnamesStyle=cscenter
   ) 
   
+  own_location<-head(arrange(S_location_breakdown[S_location_breakdown$type=="Own account", ], 
+                             desc(Settlement_Value)),n=20)
+  own_location$type<-NULL
   
+  names(own_location)<-c('Own Account', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
+  addDataFrame(own_location, sheet6, col.names=TRUE, row.names=FALSE,
+               startRow=111, startColumn=1, colStyle=list('2'=cscomma,'3'=cscurrency,'4'=cscomma,'5'=cscurrency,'6'=cscurrency),
+               colnamesStyle=cscenter
+  )
+  
+  issuer_location<-head(arrange(S_location_breakdown[S_location_breakdown$type=="Issuer-related", ], 
+                             desc(Settlement_Value)),n=20)
+  issuer_location$type<-NULL
+  
+  names(issuer_location)<-c('Issuer Related', 'Number of Instruction', 'Settlement Value','Settlement Volume','Revenue (New Fee)','Off-Exchange Fee Gain')
+  addDataFrame(issuer_location, sheet6, col.names=TRUE, row.names=FALSE,
+               startRow=133, startColumn=1, colStyle=list('2'=cscomma,'3'=cscurrency,'4'=cscomma,'5'=cscurrency,'6'=cscurrency),
+               colnamesStyle=cscenter
+  )   
   
   autoSizeColumn(sheet1, c(1,2,3,4,5,6,7))
   autoSizeColumn(sheet2, c(1,2,3,4,5,6))
